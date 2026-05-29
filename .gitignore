@@ -1,0 +1,11 @@
+# Rust compiled outputs
+/target/
+
+# SQLite database files (crucial to protect financial privacy!)
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Backup files
+*.bak
