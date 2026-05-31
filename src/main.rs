@@ -41,8 +41,8 @@ fn main() {
             handlers::handle_income(&mut conn, amount, account, source, description, date),
         Commands::Installments { cash_amount, total_amount, installments, account, category, description, interest_account, date } => 
             handlers::handle_installments(&mut conn, cash_amount, total_amount, installments, account, category, description, interest_account, date),
-        Commands::Loan { principal, total_amount, installments, bank_account, loan_account, interest_account, description, date } => 
-            handlers::handle_loan(&mut conn, principal, total_amount, installments, bank_account, loan_account, interest_account, description, date),
+        Commands::Loan { principal, total_amount, installments, bank_account, loan_account, interest_account, description, date, first_payment_date } => 
+            handlers::handle_loan(&mut conn, principal, total_amount, installments, bank_account, loan_account, interest_account, description, date, first_payment_date),
         Commands::Balance { from, to, month, year, live_rate } => 
             handlers::handle_balance(&conn, from, to, month, year, live_rate),
         Commands::Cashflow { from, to, month, year } => 

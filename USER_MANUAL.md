@@ -188,21 +188,26 @@ mango transfer --amount 100000 --from "banco" --to "inversiones" --exchange-rate
 ```
 
 ### `loan`
-Creates a loan and projects all future repayments, including principal and interest.
+Creates a loan and automatically projects all future repayments. To maintain maximum accounting clarity, prevent confusing duplicate entries, and allow month-by-month repayment tracking, Mango automatically splits your loan into two distinct liability accounts:
+1. **`<LOAN_ACCOUNT>`**: Tracks the net principal debt (receives the initial negative principal balance, and is reduced by positive principal entries on each installment).
+2. **`<LOAN_ACCOUNT> (Installments)`**: Tracks the monthly repayment obligations (holds the negative monthly installment totals).
+
+This allows you to see exactly how much you have to pay on future periods without your bank account being pre-deducted in advance. You can settle these installments month-by-month using the `pay-liability` command on the `(Installments)` account.
 
 **Usage:**
 ```sh
-mango loan --principal <P_AMT> --total-amount <T_AMT> --installments <N> --bank-account <ASSET> --loan-account <LIABILITY> --interest-account <EXPENSE> --description <DESC>
+mango loan --principal <P_AMT> --total-amount <T_AMT> --installments <N> --bank-account <ASSET> --loan-account <LIABILITY> --interest-account <EXPENSE> --description <DESC> [OPTIONS]
 ```
 **Arguments:**
 -   `--principal <P_AMT>`: The initial amount of money received.
 -   `--total-amount <T_AMT>`: The full amount that will be paid back over the life of the loan.
 -   `--installments <N>`: The number of monthly repayments.
--   `--bank-account <ASSET>`: The asset account where you receive the principal and from which repayments are made.
--   `--loan-account <LIABILITY>`: The liability account for the loan.
--   `--interest-account <EXPENSE>`: The expense account to track interest paid.
+-   `--bank-account <ASSET>`: The asset account where you receive the principal.
+-   `--loan-account <LIABILITY>`: The liability account for the loan (used for tracking loan principal). Mango will automatically create and manage `<LIABILITY> (Installments)`.
+-   `--interest-account <EXPENSE>`: The expense account to track interest paid (defaults to "Interest").
 -   `--description <DESC>`: A description for the loan.
--   `--date <YYYY-MM-DD>`: (Optional) The date the loan was received. Repayments are projected monthly from this date.
+-   `--date <YYYY-MM-DD>`: (Optional) The date the loan was received.
+-   `--first-payment-date <YYYY-MM-DD>`: (Optional) The date when the first repayment installment will be paid. Subsequent repayments are calculated monthly from this date. Defaults to 1 month after `--date`.
 
 ### `installments`
 Records a financed purchase (e.g., with a credit card) and projects all future installments.

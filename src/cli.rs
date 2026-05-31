@@ -12,7 +12,7 @@ pub const ASCII_ART: &str = "
 
 #[derive(Parser)]
 #[command(name = "mango")]
-#[command(version = "0.1.0")]
+#[command(version = "0.1.1")]
 #[command(author = "Julian")]
 #[command(about = "Double-entry CLI personal finance application", long_about = None)]
 #[command(before_help = ASCII_ART)]
@@ -120,6 +120,9 @@ pub enum Commands {
 
         #[arg(long, help = "Optional starting date (YYYY-MM-DD). Defaults to today.")]
         date: Option<String>,
+
+        #[arg(long, help = "Optional date for the first repayment (YYYY-MM-DD). Defaults to 1 month after --date.")]
+        first_payment_date: Option<String>,
     },
 
     #[command(about = "Show account balances for asset and liability types with optional time filters")]

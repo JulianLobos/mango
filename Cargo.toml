@@ -1,6 +1,6 @@
 [package]
 name = "mango"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 repository = "https://github.com/JulianLobos/mango.git"
 description = "Personal Finance Assistant on the Command Line"

@@ -422,7 +422,8 @@ pub fn handle_pay_liability(
         "SELECT COALESCE(SUM(e.amount_native), 0) FROM entries e
          JOIN transactions t ON e.transaction_id = t.id
          WHERE e.account_id = ?1 AND e.amount_native < 0 
-         AND t.date >= ?2 AND t.date <= ?3",
+         AND t.date >= ?2 AND t.date <= ?3
+         AND NOT (t.parent_group_id IS NOT NULL AND t.installment_current IS NULL)",
         params![liability_id, start_date, end_date],
         |row| row.get(0),
     )?;
@@ -431,6 +432,23 @@ pub fn handle_pay_liability(
         println!("No debt found for '{}' in {}/{}. Nothing to pay.", liability_account, month, year);
         return Ok(());
     }
+
+    let group_id_opt: Option<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT t.parent_group_id FROM entries e
+             JOIN transactions t ON e.transaction_id = t.id
+             WHERE e.account_id = ?1 AND e.amount_native < 0
+             AND t.date >= ?2 AND t.date <= ?3 AND t.parent_group_id IS NOT NULL LIMIT 1;"
+        )?;
+        let mut rows = stmt.query(params![liability_id, start_date, end_date])?;
+        if let Some(row) = rows.next()? {
+            row.get(0)?
+        } else {
+            None
+        }
+    };
+
+    let payment_parent_group_id = group_id_opt.map(|uuid| format!("PAY-{}", uuid));
 
     let payment_cents = -debt_cents;
 
@@ -445,7 +463,7 @@ pub fn handle_pay_liability(
         description,
         installment_current: None,
         installment_total: None,
-        parent_group_id: None,
+        parent_group_id: payment_parent_group_id,
         entries: vec![
             EntryInput {
                 account_name: asset_account.clone(),
@@ -731,13 +749,53 @@ pub fn handle_transfer(
 pub fn handle_delete(conn: &Connection, id: i64) -> std::result::Result<(), Box<dyn Error>> {
     check_database_initialized(conn)?;
 
-    let affected = conn.execute("DELETE FROM transactions WHERE id = ?;", params![id])?;
+    // Get the parent group ID of the transaction to delete
+    let parent_group_res: Result<Option<String>, rusqlite::Error> = conn.query_row(
+        "SELECT parent_group_id FROM transactions WHERE id = ?;",
+        params![id],
+        |row| row.get(0),
+    );
+
+    let parent_group_id = match parent_group_res {
+        Ok(id_opt) => id_opt,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return Err(format!("Transaction with ID {} not found.", id).into());
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    // If the transaction has a parent group ID:
+    // - If it's a payment (prefixed with PAY-), delete ONLY this single transaction.
+    // - Otherwise (it's a core loan/installment), delete the entire group and its payments.
+    let affected = if let Some(ref uuid) = parent_group_id {
+        if uuid.starts_with("PAY-") {
+            conn.execute("DELETE FROM transactions WHERE id = ?;", params![id])?
+        } else {
+            conn.execute(
+                "DELETE FROM transactions WHERE parent_group_id = ?1 OR parent_group_id = ?2;",
+                params![uuid, format!("PAY-{}", uuid)]
+            )?
+        }
+    } else {
+        conn.execute("DELETE FROM transactions WHERE id = ?;", params![id])?
+    };
 
     if affected == 0 {
         return Err(format!("Transaction with ID {} not found.", id).into());
     }
 
-    println!("Transaction {} and all its entries deleted successfully.", id);
+    if let Some(ref uuid) = parent_group_id {
+        if uuid.starts_with("PAY-") {
+            println!("Transaction {} is a loan/installment payment (Group UUID: {}).", id, &uuid[4..]);
+            println!("Successfully deleted this payment transaction.");
+        } else {
+            println!("Transaction {} is part of a grouped installment/loan (UUID: {}).", id, uuid);
+            println!("Successfully deleted all {} transactions/payments in this group.", affected);
+        }
+    } else {
+        println!("Transaction {} and all its entries deleted successfully.", id);
+    }
+
     Ok(())
 }
 
@@ -990,6 +1048,7 @@ pub fn handle_loan(
     interest_account: String,
     description: String,
     date: Option<String>,
+    first_payment_date: Option<String>,
 ) -> std::result::Result<(), Box<dyn Error>> {
     check_database_initialized(conn)?;
 
@@ -1006,9 +1065,18 @@ pub fn handle_loan(
 
     let currency = get_account_currency(conn, &bank_account)?;
 
-    if find_account_id(conn, &loan_account).is_err() {
-        println!("Creating missing loan account: '{}' (type: liability, currency: {})", loan_account, currency);
-        handle_account_add(conn, loan_account.clone(), "liability".to_string(), currency.clone())?;
+    // Define professional split accounts automatically
+    let loan_principal_acc = loan_account.clone();
+    let loan_cuotas_acc = format!("{} (Installments)", loan_account);
+
+    if find_account_id(conn, &loan_principal_acc).is_err() {
+        println!("Creating missing loan account: '{}' (type: liability, currency: {})", loan_principal_acc, currency);
+        handle_account_add(conn, loan_principal_acc.clone(), "liability".to_string(), currency.clone())?;
+    }
+
+    if find_account_id(conn, &loan_cuotas_acc).is_err() {
+        println!("Creating missing loan account: '{}' (type: liability, currency: {})", loan_cuotas_acc, currency);
+        handle_account_add(conn, loan_cuotas_acc.clone(), "liability".to_string(), currency.clone())?;
     }
 
     if find_account_id(conn, &interest_account).is_err() {
@@ -1028,6 +1096,12 @@ pub fn handle_loan(
         None => chrono::Local::now().naive_local().date(),
     };
 
+    let first_pay_date = match first_payment_date {
+        Some(d) => NaiveDate::parse_from_str(&d, "%Y-%m-%d")
+            .map_err(|_| "Invalid first payment date format. Use YYYY-MM-DD.")?,
+        None => start_date + Months::new(1),
+    };
+
     let parent_group_id = Uuid::new_v4().to_string();
 
     println!("Recording loan of ${:.2} to be repaid in {} installments...", principal, installments);
@@ -1036,6 +1110,7 @@ pub fn handle_loan(
     );
     println!("------------------------------------------------------------");
 
+    // 1. Record receipt of the principal in Bank and increase Principal liability
     let tx_recv = TransactionInput {
         date: start_date.format("%Y-%m-%d").to_string(),
         description: format!("{} (Loan Received)", description),
@@ -1044,7 +1119,7 @@ pub fn handle_loan(
         parent_group_id: Some(parent_group_id.clone()),
         entries: vec![
             EntryInput { account_name: bank_account.clone(), amount_native: principal_cents, exchange_rate: None },
-            EntryInput { account_name: loan_account.clone(), amount_native: -principal_cents, exchange_rate: None },
+            EntryInput { account_name: loan_principal_acc.clone(), amount_native: -principal_cents, exchange_rate: None },
         ],
     };
     let rx_id = insert_double_entry_transaction(conn, tx_recv)?;
@@ -1056,13 +1131,14 @@ pub fn handle_loan(
         bank_account
     );
 
+    // 2. Project future repayment obligations and principal reduction month-by-month
     for i in 1..=installments {
         let current_monthly_total = if i == installments { monthly_total + remainder_total } else { monthly_total };
         let current_monthly_principal = if i == installments { monthly_principal + remainder_principal } else { monthly_principal };
         let current_monthly_interest = current_monthly_total - current_monthly_principal;
 
-        let offset_months = Months::new(i as u32); 
-        let project_date = start_date + offset_months;
+        let offset_months = Months::new((i - 1) as u32); 
+        let project_date = first_pay_date + offset_months;
         let project_date_str = project_date.format("%Y-%m-%d").to_string();
 
         let tx_desc = format!("{} (Repayment {}/{})", description, i, installments);
@@ -1074,22 +1150,29 @@ pub fn handle_loan(
             installment_total: Some(installments),
             parent_group_id: Some(parent_group_id.clone()),
             entries: vec![
-                EntryInput { account_name: bank_account.clone(), amount_native: -current_monthly_total, exchange_rate: None },
-                EntryInput { account_name: loan_account.clone(), amount_native: current_monthly_principal, exchange_rate: None },
+                // Record the monthly repayment obligation (debt) on the loan cuotas liability account
+                EntryInput { account_name: loan_cuotas_acc.clone(), amount_native: -current_monthly_total, exchange_rate: None },
+                // Record the reduction of the loan principal on the loan principal liability account
+                EntryInput { account_name: loan_principal_acc.clone(), amount_native: current_monthly_principal, exchange_rate: None },
+                // Record the interest expense
                 EntryInput { account_name: interest_account.clone(), amount_native: current_monthly_interest, exchange_rate: None },
             ],
         };
 
         let tx_id = insert_double_entry_transaction(conn, tx_input)?;
         println!(
-            "  [Payment {}/{}] Projected for {} -> Transaction ID {} | -${:.2} (Principal: ${:.2}, Interest: ${:.2})", 
+            "  [Repayment {}/{}] Projected for {} -> Transaction ID {} | Installment: ${:.2} (Principal: ${:.2}, Interest: ${:.2})", 
             i, installments, project_date_str, tx_id, 
             cents_to_amount(current_monthly_total), cents_to_amount(current_monthly_principal), cents_to_amount(current_monthly_interest)
         );
     }
     
     println!("------------------------------------------------------------");
-    println!("Loan processing completed! UUID: {}", parent_group_id);
+    println!("Loan processing completed and entered successfully!");
+    println!("  - Principal account: {}", loan_principal_acc);
+    println!("  - Monthly installments account: {}", loan_cuotas_acc);
+    println!("Please use 'mango pay-liability' to pay the '{}' account monthly.", loan_cuotas_acc);
+    println!("Loan Group UUID: {}", parent_group_id);
 
     Ok(())
 }
